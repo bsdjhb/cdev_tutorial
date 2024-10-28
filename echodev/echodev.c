@@ -15,12 +15,14 @@
 
 #include "echodev.h"
 
-static MALLOC_DEFINE(M_ECHODEV, "echodev", "Demo echo character device");
+struct echodev_softc {
+	struct cdev *dev;
+	char *buf;
+	size_t len;
+	struct sx lock;
+};
 
-static struct cdev *echodev;
-static char *echobuf;
-static size_t echolen;
-static struct sx echolock;
+static MALLOC_DEFINE(M_ECHODEV, "echodev", "Demo echo character device");
 
 static d_read_t echo_read;
 static d_write_t echo_write;
@@ -37,34 +39,36 @@ static struct cdevsw echo_cdevsw = {
 static int
 echo_read(struct cdev *dev, struct uio *uio, int ioflag)
 {
+	struct echodev_softc *sc = dev->si_drv1;
 	size_t todo;
 	int error;
 
-	sx_slock(&echolock);
-	if (uio->uio_offset >= echolen) {
+	sx_slock(&sc->lock);
+	if (uio->uio_offset >= sc->len) {
 		error = 0;
 	} else {
-		todo = MIN(uio->uio_resid, echolen - uio->uio_offset);
-		error = uiomove(echobuf + uio->uio_offset, todo, uio);
+		todo = MIN(uio->uio_resid, sc->len - uio->uio_offset);
+		error = uiomove(sc->buf + uio->uio_offset, todo, uio);
 	}
-	sx_sunlock(&echolock);
+	sx_sunlock(&sc->lock);
 	return (error);
 }
 
 static int
 echo_write(struct cdev *dev, struct uio *uio, int ioflag)
 {
+	struct echodev_softc *sc = dev->si_drv1;
 	size_t todo;
 	int error;
 
-	sx_xlock(&echolock);
-	if (uio->uio_offset >= echolen) {
+	sx_xlock(&sc->lock);
+	if (uio->uio_offset >= sc->len) {
 		error = EFBIG;
 	} else {
-		todo = MIN(uio->uio_resid, echolen - uio->uio_offset);
-		error = uiomove(echobuf + uio->uio_offset, todo, uio);
+		todo = MIN(uio->uio_resid, sc->len - uio->uio_offset);
+		error = uiomove(sc->buf + uio->uio_offset, todo, uio);
 	}
-	sx_xunlock(&echolock);
+	sx_xunlock(&sc->lock);
 	return (error);
 }
 
@@ -72,13 +76,14 @@ static int
 echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
     struct thread *td)
 {
+	struct echodev_softc *sc = dev->si_drv1;
 	int error;
 
 	switch (cmd) {
 	case ECHODEV_GBUFSIZE:
-		sx_slock(&echolock);
-		*(size_t *)data = echolen;
-		sx_sunlock(&echolock);
+		sx_slock(&sc->lock);
+		*(size_t *)data = sc->len;
+		sx_sunlock(&sc->lock);
 		error = 0;
 		break;
 	case ECHODEV_SBUFSIZE:
@@ -91,17 +96,17 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		}
 
 		new_len = *(size_t *)data;
-		sx_xlock(&echolock);
-		if (new_len == echolen) {
+		sx_xlock(&sc->lock);
+		if (new_len == sc->len) {
 			/* Nothing to do. */
-		} else if (new_len < echolen) {
-			echolen = new_len;
+		} else if (new_len < sc->len) {
+			sc->len = new_len;
 		} else {
-			echobuf = reallocf(echobuf, new_len, M_ECHODEV,
+			sc->buf = reallocf(sc->buf, new_len, M_ECHODEV,
 			    M_WAITOK | M_ZERO);
-			echolen = new_len;
+			sc->len = new_len;
 		}
-		sx_xunlock(&echolock);
+		sx_xunlock(&sc->lock);
 		error = 0;
 		break;
 	}
@@ -111,9 +116,9 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 			break;
 		}
 
-		sx_xlock(&echolock);
-		memset(echobuf, 0, echolen);
-		sx_xunlock(&echolock);
+		sx_xlock(&sc->lock);
+		memset(sc->buf, 0, sc->len);
+		sx_xunlock(&sc->lock);
 		error = 0;
 		break;
 	default:
@@ -124,42 +129,54 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 }
 
 static int
-echodev_load(size_t len)
+echodev_create(struct echodev_softc **scp, size_t len)
 {
 	struct make_dev_args args;
+	struct echodev_softc *sc;
 	int error;
 
-	sx_init(&echolock, "echo");
-	echobuf = malloc(len, M_ECHODEV, M_WAITOK | M_ZERO);
-	echolen = len;
+	sc = malloc(sizeof(*sc), M_ECHODEV, M_WAITOK | M_ZERO);
+	sx_init(&sc->lock, "echo");
+	sc->buf = malloc(len, M_ECHODEV, M_WAITOK | M_ZERO);
+	sc->len = len;
 	make_dev_args_init(&args);
 	args.mda_flags = MAKEDEV_WAITOK | MAKEDEV_CHECKNAME;
 	args.mda_devsw = &echo_cdevsw;
 	args.mda_uid = UID_ROOT;
 	args.mda_gid = GID_WHEEL;
 	args.mda_mode = 0600;
-	error = make_dev_s(&args, &echodev, "echo");
+	args.mda_si_drv1 = sc;
+	error = make_dev_s(&args, &sc->dev, "echo");
+	if (error != 0) {
+		free(sc->buf, M_ECHODEV);
+		sx_destroy(&sc->lock);
+		free(sc, M_ECHODEV);
+	}
 	return (error);
 }
 
-static int
-echodev_unload(void)
+static void
+echodev_destroy(struct echodev_softc *sc)
 {
-	if (echodev != NULL)
-		destroy_dev(echodev);
-	sx_destroy(&echolock);
-	free(echobuf, M_ECHODEV);
-	return (0);
+	if (sc->dev != NULL)
+		destroy_dev(sc->dev);
+	free(sc->buf, M_ECHODEV);
+	sx_destroy(&sc->lock);
+	free(sc, M_ECHODEV);
 }
 
 static int
 echodev_modevent(module_t mod, int type, void *data)
 {
+	static struct echodev_softc *echo_softc;
+
 	switch (type) {
 	case MOD_LOAD:
-		return (echodev_load(64));
+		return (echodev_create(&echo_softc, 64));
 	case MOD_UNLOAD:
-		return (echodev_unload());
+		if (echo_softc != NULL)
+			echodev_destroy(echo_softc);
+		return (0);
 	default:
 		return (EOPNOTSUPP);
 	}
