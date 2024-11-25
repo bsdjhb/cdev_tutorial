@@ -151,8 +151,10 @@ echodev_create(struct echodev_softc **scp, size_t len)
 		free(sc->buf, M_ECHODEV);
 		sx_destroy(&sc->lock);
 		free(sc, M_ECHODEV);
+		return (error);
 	}
-	return (error);
+	*scp = sc;
+	return (0);
 }
 
 static void
