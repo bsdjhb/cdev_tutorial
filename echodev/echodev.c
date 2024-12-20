@@ -21,6 +21,7 @@ struct echodev_softc {
 	size_t len;
 	size_t valid;
 	struct sx lock;
+	bool dying;
 };
 
 static MALLOC_DEFINE(M_ECHODEV, "echodev", "Demo echo character device");
@@ -51,7 +52,10 @@ echo_read(struct cdev *dev, struct uio *uio, int ioflag)
 
 	/* Wait for bytes to read. */
 	while (sc->valid == 0) {
-		error = sx_sleep(sc, &sc->lock, PCATCH, "echord", 0);
+		if (sc->dying)
+			error = ENXIO;
+		else
+			error = sx_sleep(sc, &sc->lock, PCATCH, "echord", 0);
 		if (error != 0) {
 			sx_xunlock(&sc->lock);
 			return (error);
@@ -86,7 +90,11 @@ echo_write(struct cdev *dev, struct uio *uio, int ioflag)
 	while (uio->uio_resid != 0) {
 		/* Wait for space to write. */
 		while (sc->valid == sc->len) {
-			error = sx_sleep(sc, &sc->lock, PCATCH, "echowr", 0);
+			if (sc->dying)
+				error = ENXIO;
+			else
+				error = sx_sleep(sc, &sc->lock, PCATCH, "echowr",
+				    0);
 			if (error != 0) {
 				sx_xunlock(&sc->lock);
 				return (error);
@@ -207,8 +215,15 @@ echodev_create(struct echodev_softc **scp, size_t len)
 static void
 echodev_destroy(struct echodev_softc *sc)
 {
-	if (sc->dev != NULL)
+	if (sc->dev != NULL) {
+		/* Force any sleeping threads to exit the driver. */
+		sx_xlock(&sc->lock);
+		sc->dying = true;
+		wakeup(sc);
+		sx_xunlock(&sc->lock);
+
 		destroy_dev(sc->dev);
+	}
 	free(sc->buf, M_ECHODEV);
 	sx_destroy(&sc->lock);
 	free(sc, M_ECHODEV);
