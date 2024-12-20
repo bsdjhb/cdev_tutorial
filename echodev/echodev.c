@@ -19,6 +19,7 @@ struct echodev_softc {
 	struct cdev *dev;
 	char *buf;
 	size_t len;
+	size_t valid;
 	struct sx lock;
 };
 
@@ -43,14 +44,14 @@ echo_read(struct cdev *dev, struct uio *uio, int ioflag)
 	size_t todo;
 	int error;
 
-	sx_slock(&sc->lock);
-	if (uio->uio_offset >= sc->len) {
-		error = 0;
-	} else {
-		todo = MIN(uio->uio_resid, sc->len - uio->uio_offset);
-		error = uiomove(sc->buf + uio->uio_offset, todo, uio);
+	sx_xlock(&sc->lock);
+	todo = MIN(uio->uio_resid, sc->valid);
+	error = uiomove(sc->buf, todo, uio);
+	if (error == 0) {
+		sc->valid -= todo;
+		memmove(sc->buf, sc->buf + todo, sc->valid);
 	}
-	sx_sunlock(&sc->lock);
+	sx_xunlock(&sc->lock);
 	return (error);
 }
 
@@ -62,12 +63,10 @@ echo_write(struct cdev *dev, struct uio *uio, int ioflag)
 	int error;
 
 	sx_xlock(&sc->lock);
-	if (uio->uio_offset >= sc->len) {
-		error = EFBIG;
-	} else {
-		todo = MIN(uio->uio_resid, sc->len - uio->uio_offset);
-		error = uiomove(sc->buf + uio->uio_offset, todo, uio);
-	}
+	todo = MIN(uio->uio_resid, sc->len - sc->valid);
+	error = uiomove(sc->buf + sc->valid, todo, uio);
+	if (error == 0)
+		sc->valid += todo;
 	sx_xunlock(&sc->lock);
 	return (error);
 }
@@ -95,19 +94,22 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 			break;
 		}
 
+		error = 0;
 		new_len = *(size_t *)data;
 		sx_xlock(&sc->lock);
 		if (new_len == sc->len) {
 			/* Nothing to do. */
 		} else if (new_len < sc->len) {
-			sc->len = new_len;
+			if (new_len < sc->valid)
+				error = EBUSY;
+			else
+				sc->len = new_len;
 		} else {
 			sc->buf = reallocf(sc->buf, new_len, M_ECHODEV,
 			    M_WAITOK | M_ZERO);
 			sc->len = new_len;
 		}
 		sx_xunlock(&sc->lock);
-		error = 0;
 		break;
 	}
 	case ECHODEV_CLEAR:
@@ -117,7 +119,7 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		}
 
 		sx_xlock(&sc->lock);
-		memset(sc->buf, 0, sc->len);
+		sc->valid = 0;
 		sx_xunlock(&sc->lock);
 		error = 0;
 		break;
