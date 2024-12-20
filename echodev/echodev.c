@@ -8,6 +8,7 @@
 #include <sys/conf.h>
 #include <sys/fcntl.h>
 #include <sys/kernel.h>
+#include <sys/limits.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/sx.h>
@@ -21,22 +22,63 @@ struct echodev_softc {
 	size_t len;
 	size_t valid;
 	struct sx lock;
+	u_int writers;
 	bool dying;
 };
 
 static MALLOC_DEFINE(M_ECHODEV, "echodev", "Demo echo character device");
 
+static d_open_t echo_open;
+static d_close_t echo_close;
 static d_read_t echo_read;
 static d_write_t echo_write;
 static d_ioctl_t echo_ioctl;
 
 static struct cdevsw echo_cdevsw = {
 	.d_version =	D_VERSION,
+	.d_open =	echo_open,
+	.d_close =	echo_close,
 	.d_read =	echo_read,
 	.d_write =	echo_write,
 	.d_ioctl =	echo_ioctl,
+	.d_flags =	D_TRACKCLOSE,
 	.d_name =	"echo"
 };
+
+static int
+echo_open(struct cdev *dev, int fflag, int devtype, struct thread *td)
+{
+	struct echodev_softc *sc = dev->si_drv1;
+
+	if ((fflag & FWRITE) != 0) {
+		/* Increase the number of writers. */
+		sx_xlock(&sc->lock);
+		if (sc->writers == UINT_MAX) {
+			sx_xunlock(&sc->lock);
+			return (EBUSY);
+		}
+		sc->writers++;
+		sx_xunlock(&sc->lock);
+	}
+	return (0);
+}
+
+static int
+echo_close(struct cdev *dev, int fflag, int devtype, struct thread *td)
+{
+	struct echodev_softc *sc = dev->si_drv1;
+
+	if ((fflag & FWRITE) != 0) {
+		sx_xlock(&sc->lock);
+		sc->writers--;
+		if (sc->writers == 0) {
+			/* Wakeup any waiting readers. */
+			wakeup(sc);
+		}
+		sx_xunlock(&sc->lock);
+	}
+	return (0);
+}
 
 static int
 echo_read(struct cdev *dev, struct uio *uio, int ioflag)
@@ -51,7 +93,7 @@ echo_read(struct cdev *dev, struct uio *uio, int ioflag)
 	sx_xlock(&sc->lock);
 
 	/* Wait for bytes to read. */
-	while (sc->valid == 0) {
+	while (sc->valid == 0 && sc->writers != 0) {
 		if (sc->dying)
 			error = ENXIO;
 		else
