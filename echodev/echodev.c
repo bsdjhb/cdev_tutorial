@@ -44,10 +44,27 @@ echo_read(struct cdev *dev, struct uio *uio, int ioflag)
 	size_t todo;
 	int error;
 
+	if (uio->uio_resid == 0)
+		return (0);
+
 	sx_xlock(&sc->lock);
+
+	/* Wait for bytes to read. */
+	while (sc->valid == 0) {
+		error = sx_sleep(sc, &sc->lock, PCATCH, "echord", 0);
+		if (error != 0) {
+			sx_xunlock(&sc->lock);
+			return (error);
+		}
+	}
+
 	todo = MIN(uio->uio_resid, sc->valid);
 	error = uiomove(sc->buf, todo, uio);
 	if (error == 0) {
+		/* Wakeup any waiting writers. */
+		if (sc->valid == sc->len)
+			wakeup(sc);
+
 		sc->valid -= todo;
 		memmove(sc->buf, sc->buf + todo, sc->valid);
 	}
@@ -62,11 +79,30 @@ echo_write(struct cdev *dev, struct uio *uio, int ioflag)
 	size_t todo;
 	int error;
 
+	if (uio->uio_resid == 0)
+		return (0);
+
 	sx_xlock(&sc->lock);
-	todo = MIN(uio->uio_resid, sc->len - sc->valid);
-	error = uiomove(sc->buf + sc->valid, todo, uio);
-	if (error == 0)
-		sc->valid += todo;
+	while (uio->uio_resid != 0) {
+		/* Wait for space to write. */
+		while (sc->valid == sc->len) {
+			error = sx_sleep(sc, &sc->lock, PCATCH, "echowr", 0);
+			if (error != 0) {
+				sx_xunlock(&sc->lock);
+				return (error);
+			}
+		}
+
+		todo = MIN(uio->uio_resid, sc->len - sc->valid);
+		error = uiomove(sc->buf + sc->valid, todo, uio);
+		if (error == 0) {
+			/* Wakeup any waiting readers. */
+			if (sc->valid == 0)
+				wakeup(sc);
+
+			sc->valid += todo;
+		}
+	}
 	sx_xunlock(&sc->lock);
 	return (error);
 }
@@ -105,6 +141,10 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 			else
 				sc->len = new_len;
 		} else {
+			/* Wakeup any waiting writers. */
+			if (sc->valid == sc->len)
+				wakeup(sc);
+
 			sc->buf = reallocf(sc->buf, new_len, M_ECHODEV,
 			    M_WAITOK | M_ZERO);
 			sc->len = new_len;
@@ -119,6 +159,11 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		}
 
 		sx_xlock(&sc->lock);
+
+		/* Wakeup any waiting writers. */
+		if (sc->valid == sc->len)
+			wakeup(sc);
+
 		sc->valid = 0;
 		sx_xunlock(&sc->lock);
 		error = 0;
