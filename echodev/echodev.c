@@ -245,6 +245,18 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		else
 			error = 0;
 		break;
+	case FIONREAD:
+		sx_slock(&sc->lock);
+		*(int *)data = MIN(INT_MAX, sc->valid);
+		sx_sunlock(&sc->lock);
+		error = 0;
+		break;
+	case FIONWRITE:
+		sx_slock(&sc->lock);
+		*(int *)data = MIN(INT_MAX, sc->len - sc->valid);
+		sx_sunlock(&sc->lock);
+		error = 0;
+		break;
 	default:
 		error = ENOTTY;
 		break;
