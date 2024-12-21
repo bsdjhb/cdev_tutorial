@@ -7,6 +7,7 @@
 #include <sys/param.h>
 #include <sys/conf.h>
 #include <sys/fcntl.h>
+#include <sys/filio.h>
 #include <sys/kernel.h>
 #include <sys/limits.h>
 #include <sys/malloc.h>
@@ -96,6 +97,8 @@ echo_read(struct cdev *dev, struct uio *uio, int ioflag)
 	while (sc->valid == 0 && sc->writers != 0) {
 		if (sc->dying)
 			error = ENXIO;
+		else if (ioflag & O_NONBLOCK)
+			error = EWOULDBLOCK;
 		else
 			error = sx_sleep(sc, &sc->lock, PCATCH, "echord", 0);
 		if (error != 0) {
@@ -134,6 +137,8 @@ echo_write(struct cdev *dev, struct uio *uio, int ioflag)
 		while (sc->valid == sc->len) {
 			if (sc->dying)
 				error = ENXIO;
+			else if (ioflag & O_NONBLOCK)
+				error = EWOULDBLOCK;
 			else
 				error = sx_sleep(sc, &sc->lock, PCATCH, "echowr",
 				    0);
@@ -217,6 +222,17 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		sc->valid = 0;
 		sx_xunlock(&sc->lock);
 		error = 0;
+		break;
+	case FIONBIO:
+		/* O_NONBLOCK is supported. */
+		error = 0;
+		break;
+	case FIOASYNC:
+		/* O_ASYNC is not supported. */
+		if (*(int *)data != 0)
+			error = EINVAL;
+		else
+			error = 0;
 		break;
 	default:
 		error = ENOTTY;
