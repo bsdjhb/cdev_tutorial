@@ -12,6 +12,8 @@
 #include <sys/limits.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
+#include <sys/poll.h>
+#include <sys/selinfo.h>
 #include <sys/sx.h>
 #include <sys/uio.h>
 
@@ -23,6 +25,8 @@ struct echodev_softc {
 	size_t len;
 	size_t valid;
 	struct sx lock;
+	struct selinfo rsel;
+	struct selinfo wsel;
 	u_int writers;
 	bool dying;
 };
@@ -34,6 +38,7 @@ static d_close_t echo_close;
 static d_read_t echo_read;
 static d_write_t echo_write;
 static d_ioctl_t echo_ioctl;
+static d_poll_t echo_poll;
 
 static struct cdevsw echo_cdevsw = {
 	.d_version =	D_VERSION,
@@ -42,6 +47,7 @@ static struct cdevsw echo_cdevsw = {
 	.d_read =	echo_read,
 	.d_write =	echo_write,
 	.d_ioctl =	echo_ioctl,
+	.d_poll =	echo_poll,
 	.d_flags =	D_TRACKCLOSE,
 	.d_name =	"echo"
 };
@@ -75,6 +81,7 @@ echo_close(struct cdev *dev, int fflag, int devtype, struct thread *td)
 		if (sc->writers == 0) {
 			/* Wakeup any waiting readers. */
 			wakeup(sc);
+			selwakeup(&sc->rsel);
 		}
 		sx_xunlock(&sc->lock);
 	}
@@ -116,6 +123,7 @@ echo_read(struct cdev *dev, struct uio *uio, int ioflag)
 
 		sc->valid -= todo;
 		memmove(sc->buf, sc->buf + todo, sc->valid);
+		selwakeup(&sc->wsel);
 	}
 	sx_xunlock(&sc->lock);
 	return (error);
@@ -156,6 +164,7 @@ echo_write(struct cdev *dev, struct uio *uio, int ioflag)
 				wakeup(sc);
 
 			sc->valid += todo;
+			selwakeup(&sc->rsel);
 		}
 	}
 	sx_xunlock(&sc->lock);
@@ -203,6 +212,7 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 			sc->buf = reallocf(sc->buf, new_len, M_ECHODEV,
 			    M_WAITOK | M_ZERO);
 			sc->len = new_len;
+			selwakeup(&sc->wsel);
 		}
 		sx_xunlock(&sc->lock);
 		break;
@@ -220,6 +230,7 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 			wakeup(sc);
 
 		sc->valid = 0;
+		selwakeup(&sc->wsel);
 		sx_xunlock(&sc->lock);
 		error = 0;
 		break;
@@ -239,6 +250,28 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		break;
 	}
 	return (error);
+}
+
+static int
+echo_poll(struct cdev *dev, int events, struct thread *td)
+{
+	struct echodev_softc *sc = dev->si_drv1;
+	int revents;
+
+	revents = 0;
+	sx_slock(&sc->lock);
+	if (sc->valid != 0 || sc->writers == 0)
+		revents |= events & (POLLIN | POLLRDNORM);
+	if (sc->valid < sc->len)
+		revents |= events & (POLLOUT | POLLWRNORM);
+	if (revents == 0) {
+		if ((events & (POLLIN | POLLRDNORM)) != 0)
+			selrecord(td, &sc->rsel);
+		if ((events & (POLLOUT | POLLWRNORM)) != 0)
+			selrecord(td, &sc->wsel);
+	}
+	sx_sunlock(&sc->lock);
+	return (revents);
 }
 
 static int
@@ -282,6 +315,8 @@ echodev_destroy(struct echodev_softc *sc)
 
 		destroy_dev(sc->dev);
 	}
+	seldrain(&sc->rsel);
+	seldrain(&sc->wsel);
 	free(sc->buf, M_ECHODEV);
 	sx_destroy(&sc->lock);
 	free(sc, M_ECHODEV);
