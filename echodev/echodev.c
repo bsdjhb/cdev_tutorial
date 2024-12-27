@@ -39,6 +39,23 @@ static d_read_t echo_read;
 static d_write_t echo_write;
 static d_ioctl_t echo_ioctl;
 static d_poll_t echo_poll;
+static d_kqfilter_t echo_kqfilter;
+static void	echo_kqread_detach(struct knote *);
+static int	echo_kqread_event(struct knote *, long);
+static void	echo_kqwrite_detach(struct knote *);
+static int	echo_kqwrite_event(struct knote *, long);
+
+static struct filterops echo_read_filterops = {
+	.f_isfd =	1,
+	.f_detach =	echo_kqread_detach,
+	.f_event =	echo_kqread_event
+};
+
+static struct filterops echo_write_filterops = {
+	.f_isfd =	1,
+	.f_detach =	echo_kqwrite_detach,
+	.f_event =	echo_kqwrite_event
+};
 
 static struct cdevsw echo_cdevsw = {
 	.d_version =	D_VERSION,
@@ -48,6 +65,7 @@ static struct cdevsw echo_cdevsw = {
 	.d_write =	echo_write,
 	.d_ioctl =	echo_ioctl,
 	.d_poll =	echo_poll,
+	.d_kqfilter =	echo_kqfilter,
 	.d_flags =	D_TRACKCLOSE,
 	.d_name =	"echo"
 };
@@ -82,6 +100,7 @@ echo_close(struct cdev *dev, int fflag, int devtype, struct thread *td)
 			/* Wakeup any waiting readers. */
 			wakeup(sc);
 			selwakeup(&sc->rsel);
+			KNOTE_LOCKED(&sc->rsel.si_note, 0);
 		}
 		sx_xunlock(&sc->lock);
 	}
@@ -124,6 +143,7 @@ echo_read(struct cdev *dev, struct uio *uio, int ioflag)
 		sc->valid -= todo;
 		memmove(sc->buf, sc->buf + todo, sc->valid);
 		selwakeup(&sc->wsel);
+		KNOTE_LOCKED(&sc->wsel.si_note, 0);
 	}
 	sx_xunlock(&sc->lock);
 	return (error);
@@ -165,6 +185,7 @@ echo_write(struct cdev *dev, struct uio *uio, int ioflag)
 
 			sc->valid += todo;
 			selwakeup(&sc->rsel);
+			KNOTE_LOCKED(&sc->rsel.si_note, 0);
 		}
 	}
 	sx_xunlock(&sc->lock);
@@ -213,6 +234,7 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 			    M_WAITOK | M_ZERO);
 			sc->len = new_len;
 			selwakeup(&sc->wsel);
+			KNOTE_LOCKED(&sc->wsel.si_note, 0);
 		}
 		sx_xunlock(&sc->lock);
 		break;
@@ -231,6 +253,7 @@ echo_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 
 		sc->valid = 0;
 		selwakeup(&sc->wsel);
+		KNOTE_LOCKED(&sc->wsel.si_note, 0);
 		sx_xunlock(&sc->lock);
 		error = 0;
 		break;
@@ -287,6 +310,97 @@ echo_poll(struct cdev *dev, int events, struct thread *td)
 }
 
 static int
+echo_kqfilter(struct cdev *dev, struct knote *kn)
+{
+	struct echodev_softc *sc = dev->si_drv1;
+
+	switch (kn->kn_filter) {
+	case EVFILT_READ:
+		kn->kn_fop = &echo_read_filterops;
+		kn->kn_hook = sc;
+		knlist_add(&sc->rsel.si_note, kn, 0);
+		return (0);
+	case EVFILT_WRITE:
+		kn->kn_fop = &echo_write_filterops;
+		kn->kn_hook = sc;
+		knlist_add(&sc->wsel.si_note, kn, 0);
+		return (0);
+	default:
+		return (EINVAL);
+	}
+}
+
+static void
+echo_kqread_detach(struct knote *kn)
+{
+	struct echodev_softc *sc = kn->kn_hook;
+
+	knlist_remove(&sc->rsel.si_note, kn, 0);
+}
+
+static int
+echo_kqread_event(struct knote *kn, long hint)
+{
+	struct echodev_softc *sc = kn->kn_hook;
+
+	kn->kn_data = sc->valid;
+	if (sc->writers == 0) {
+		kn->kn_flags |= EV_EOF;
+		return (1);
+	}
+	kn->kn_flags &= ~EV_EOF;
+	return (kn->kn_data > 0);
+}
+
+static void
+echo_kqwrite_detach(struct knote *kn)
+{
+	struct echodev_softc *sc = kn->kn_hook;
+
+	knlist_remove(&sc->wsel.si_note, kn, 0);
+}
+
+static int
+echo_kqwrite_event(struct knote *kn, long hint)
+{
+	struct echodev_softc *sc = kn->kn_hook;
+
+	kn->kn_data = sc->len - sc->valid;
+	return (kn->kn_data > 0);
+}
+
+static void
+echo_kn_lock(void *arg)
+{
+	struct sx *sx = arg;
+
+	sx_xlock(sx);
+}
+
+static void
+echo_kn_unlock(void *arg)
+{
+	struct sx *sx = arg;
+
+	sx_xunlock(sx);
+}
+
+static void
+echo_kn_assert_lock(void *arg, int what)
+{
+	struct sx *sx __diagused = arg;
+
+	sx_assert(sx, what);
+}
+
+static void
+echo_knlist_init(struct knlist *knl, struct echodev_softc *sc)
+{
+	knlist_init(knl, &sc->lock, echo_kn_lock, echo_kn_unlock,
+	    echo_kn_assert_lock);
+}
+
+static int
 echodev_create(struct echodev_softc **scp, size_t len)
 {
 	struct make_dev_args args;
@@ -295,6 +409,8 @@ echodev_create(struct echodev_softc **scp, size_t len)
 
 	sc = malloc(sizeof(*sc), M_ECHODEV, M_WAITOK | M_ZERO);
 	sx_init(&sc->lock, "echo");
+	echo_knlist_init(&sc->rsel.si_note, sc);
+	echo_knlist_init(&sc->wsel.si_note, sc);
 	sc->buf = malloc(len, M_ECHODEV, M_WAITOK | M_ZERO);
 	sc->len = len;
 	make_dev_args_init(&args);
@@ -307,6 +423,8 @@ echodev_create(struct echodev_softc **scp, size_t len)
 	error = make_dev_s(&args, &sc->dev, "echo");
 	if (error != 0) {
 		free(sc->buf, M_ECHODEV);
+		knlist_destroy(&sc->rsel.si_note);
+		knlist_destroy(&sc->wsel.si_note);
 		sx_destroy(&sc->lock);
 		free(sc, M_ECHODEV);
 		return (error);
@@ -327,6 +445,8 @@ echodev_destroy(struct echodev_softc *sc)
 
 		destroy_dev(sc->dev);
 	}
+	knlist_destroy(&sc->rsel.si_note);
+	knlist_destroy(&sc->wsel.si_note);
 	seldrain(&sc->rsel);
 	seldrain(&sc->wsel);
 	free(sc->buf, M_ECHODEV);
