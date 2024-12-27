@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <sys/event.h>
 #include <sys/ioctl.h>
 #include <sys/poll.h>
 #include <err.h>
@@ -23,6 +24,7 @@ usage(void)
 	    "\n"
 	    "Where command is one of:\n"
 	    "\tclear\t\t- clear buffer contents\n"
+	    "\tevents [-rwW]\t- display I/O status events\n"
 	    "\tpoll [-rwW]\t- display I/O status\n"
 	    "\tresize <size>\t- set buffer size\n"
 	    "\tsize\t\t- display buffer size\n");
@@ -116,6 +118,89 @@ status(int argc, char **argv)
 }
 
 static void
+display_event(struct kevent *kev)
+{
+	printf("%s: ", sysdecode_kevent_filter(kev->filter));
+	if (sysdecode_kevent_flags(stdout, kev->flags & ~EV_CLEAR, NULL))
+		printf(" ");
+	if (kev->flags & EV_ERROR)
+		printf(" error: %s", strerror(kev->data));
+	else
+		printf("%jd bytes\n", (intmax_t)kev->data);
+}
+
+static void
+events(int argc, char **argv)
+{
+	static struct timespec ts0;
+	struct kevent kev;
+	struct timespec *ts;
+	int ch, events, fd, kq;
+	bool wait;
+
+	argc--;
+	argv++;
+
+	events = 0;
+	wait = false;
+	while ((ch = getopt(argc, argv, "rwW")) != -1) {
+		switch (ch) {
+		case 'r':
+			events |= POLLIN;
+			break;
+		case 'w':
+			events |= POLLOUT;
+			break;
+		case 'W':
+			wait = true;
+			break;
+		default:
+			usage();
+		}
+	}
+
+	argc -= optind;
+	argv += optind;
+	if (argc != 0)
+		usage();
+
+	if (events == 0)
+		events = POLLIN | POLLOUT;
+
+	kq = kqueue();
+	if (kq == -1)
+		err(1, "kqueue");
+	fd = open_device(O_RDONLY);
+	if ((events & POLLIN) != 0) {
+		EV_SET(&kev, fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+		if (kevent(kq, &kev, 1, NULL, 0, NULL) == -1)
+			err(1, "kevent(EVFILT_READ, EV_ADD)");
+	}
+	if ((events & POLLOUT) != 0) {
+		EV_SET(&kev, fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, NULL);
+		if (kevent(kq, &kev, 1, NULL, 0, NULL) == -1)
+			err(1, "kevent(EVFILT_WRITE, EV_ADD)");
+	}
+
+	if (wait)
+		ts = NULL;
+	else
+		ts = &ts0;
+	for (;;) {
+		events = kevent(kq, NULL, 0, &kev, 1, ts);
+		if (events == -1)
+			err(1, "kevent");
+		if (events == 0)
+			break;
+		else
+			display_event(&kev);
+	}
+
+	close(fd);
+	close(kq);
+}
+
+static void
 resize(int argc, char **argv)
 {
 	const char *errstr;
@@ -160,6 +245,8 @@ main(int argc, char **argv)
 
 	if (strcmp(argv[1], "clear") == 0)
 		clear(argc, argv);
+	else if (strcmp(argv[1], "events") == 0)
+		events(argc, argv);
 	else if (strcmp(argv[1], "poll") == 0)
 		status(argc, argv);
 	else if (strcmp(argv[1], "resize") == 0)
