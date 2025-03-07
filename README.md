@@ -11,3 +11,4 @@ Directory | Description
 --- | ---
 echodev | /dev/echo character device driver demonstrating I/O in articles 1 and 2
 echoctl | Utility for controlling and inspecting /dev/echo
+maprw | Utility to read data from and write data to memory mappings
