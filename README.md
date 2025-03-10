@@ -13,3 +13,4 @@ echodev | /dev/echo character device driver demonstrating I/O in articles 1 and 
 echoctl | Utility for controlling and inspecting /dev/echo
 mappage | /dev/mappage character device driver exporting a single page of RAM
 maprw | Utility to read data from and write data to memory mappings
+memfd | /dev/memfd character device providing per-open anonymous memory
